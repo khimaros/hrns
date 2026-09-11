@@ -1,15 +1,18 @@
 [package]
-name = "airun"
+name = "hrns"
 version = "0.3.0"
 edition = "2021"
 
+[workspace]
+members = ["hrns-core"]
+
 [dependencies]
+hrns-core = { path = "hrns-core" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "1.1"
 futures-util = "0.3"
-serde_yaml = "0.9.34"
+async-trait = "0.1"
 rig-core = "0.36.0"
 clap = { version = "4.6.1", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

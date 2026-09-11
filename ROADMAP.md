@@ -41,6 +41,51 @@
   - [ ] `on_error` / `on_permission` stages
 - [x] `--dump-request` (`-D`) flag emits exact OpenAI chat-completions JSON request body
 - [x] `make precommit` target (lint + test + build)
-- [x] configurable tool-call output truncation (stderr display); full content spooled to `$XDG_CACHE_HOME/airun/<pid>/<seq>.txt` with a clear warning
+- [x] configurable tool-call output truncation (stderr display); full content spooled to `$XDG_CACHE_HOME/hrns/<pid>/<seq>.txt` with a clear warning
 - [x] `read` tool: optional `offset` (0-indexed line) and `count` (number of lines) parameters
 - [x] config `default_system_prompt` used when no `-s` and no agent body
+
+## hrns / hmux backend lift
+
+lift hrns's agent loop into a reusable `hrns-core` library so hmux can drive it in-process as its
+most capable backend (../hmux ROADMAP phase 34). the CLI keeps working as a second consumer; no
+behavior change. the airun -> hrns rename was a SEPARATE atomic step done at the hmux 34e cutover -
+the repo/crate/config/binary names all became `hrns` (a hard cutover, no old-path fallback).
+
+- [x] convert to a cargo workspace: `hrns-core` (lib) + `hrns` (bin, a root package that is also
+      the workspace). the bin keeps its src/ + tests/ + example toml in place. `make` targets now run
+      `--workspace` so the core crate's tests + clippy run too.
+- [x] move the HCP-agnostic, tty-agnostic core into the lib: config (config.rs), glob (glob.rs), the
+      permission model (permission.rs), agent/skill/markdown resolution (resolve.rs), the built-in
+      read/bash tools (tools.rs), and the rig agent loop (agent.rs) -- with all their unit tests. a
+      `catalog()` of providers+models is deferred to hmux 34b (its shape follows the hmux manifest;
+      hrns's config carries no per-provider model list).
+- [x] core stays HCP-AGNOSTIC: the HCP host (src/hooks.rs, the v3 hcp-spec host) stays BIN-SIDE and
+      imports the permission bits from `hrns_core`. hmux hosts HCP at the hub layer (its hcp face),
+      so a core-embedded host would double-host an hmux-driven session.
+- [x] seam `Observer` (agent.rs): the loop reports text/reasoning/tool events through it instead of
+      printing; the CLI's `StdioObserver` reproduces the stdout/stderr rendering (incl. spool +
+      truncation) verbatim. hmux maps each call to a normalized hub event.
+- [x] seam `PermissionResolver`: the "ask" branch of check_tool_permission takes a `&dyn
+      PermissionResolver`; the CLI supplies `TtyResolver` (/dev/tty + --yes). SYNC for now (the CLI
+      blocks on tty, preserving behavior); async-ified when the hmux impl lands (34b).
+- [x] seam `ToolMiddleware` (tools.rs): before/after-tool + the gated hook-registered tool set. the
+      CLI's `HcpMiddleware` adapts src/hooks.rs onto it; hmux adapts its interceptor bridge. (system-
+      prompt mutation stays a direct main->HCP `mutate_request`; before_stop stays a direct main->HCP
+      call on the exit info `run` returns.)
+- [x] seam: history in/out. `run` takes `history: Vec<ChatMessage>` in and returns
+      `RunOutcome { exit_reason, exit_error, history }`, using rig `stream_chat(prompt, &history)` +
+      `FinalResponse.history()` to accumulate; `ChatMessage` (= rig Message) + `RunOutcome` re-exported.
+      the core stays sessionless; the hmux backend stores the Vec per session for follow-up turns.
+- [x] the caller-supplied seams `PermissionResolver` + `ToolMiddleware` went ASYNC (`#[async_trait]`,
+      new dep async-trait); `check_tool_permission` is async and the tools await it. the CLI's
+      `TtyResolver`/`HcpMiddleware` are async but behavior-preserving (blocking tty/subprocess inside
+      async, as before); the hmux `InterceptorResolver` awaits `interceptor.raise` for the native gate.
+- [x] `resolve_provider` (a `<provider>/<model>` string + Config -> rig client wiring) added to
+      hrns-core, shared by the CLI and the hmux backend (DRY).
+- [ ] seam: a CancellationToken for abort + a steer channel (for hmux steering, 34c). still pending;
+      best built alongside the hmux abort/steer work.
+- [x] keep `make precommit` green: all rust tests pass -- 18 bin + 23 integration + 20 core = 61 --
+      and 53/53 python conformance checks pass. the HCP host was upgraded v2 -> v3 (host.version=3 +
+      the base payload carries the workspace `cwd`, echoed by hooks as `<hcp-cwd>`), closing the two
+      previously-failing conformance checks.

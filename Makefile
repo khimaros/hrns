@@ -1,20 +1,27 @@
-AIRUN_BIN := $(PWD)/target/debug/airun
+HRNS_BIN := $(PWD)/target/debug/hrns
+
+# TARGET selects a cross-compilation triple; unset builds for the host.
+CARGO_TARGET := $(if $(TARGET),--target $(TARGET))
 
 build:
-	cargo build
+	cargo build --workspace
 .PHONY: build
 
+build-release:
+	cargo build --workspace --release --locked $(CARGO_TARGET)
+.PHONY: build-release
+
 test:
-	cargo test
+	cargo test --workspace
 .PHONY: test
 
 test-integration: build
-	AIRUN_BIN=$(AIRUN_BIN) python3 ./tests/airun_integration_test.py
+	HRNS_BIN=$(HRNS_BIN) python3 ./tests/hrns_integration_test.py
 .PHONY: test-integration
 
 lint:
-	cargo check
-	cargo clippy
+	cargo check --workspace
+	cargo clippy --workspace
 .PHONY: lint
 
 format:

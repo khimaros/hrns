@@ -1,23 +1,25 @@
 mod hooks;
 
+use async_trait::async_trait;
 use clap::{CommandFactory, Parser};
-use rig::client::CompletionClient;
 use rig::completion::ToolDefinition;
-use rig::providers;
-use rig::streaming::StreamingPrompt;
-use rig::tool::{Tool, ToolError};
-use serde::{Deserialize, Deserializer, de};
-use std::collections::HashMap;
+use rig::tool::ToolDyn;
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, Read, Write, IsTerminal};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::Arc;
-use futures_util::stream::StreamExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use hooks::HookManager;
+use hrns_core::{
+    append_skills, bash_tool_definition, build_system_prompt, find_all_in_dirs, load_agent,
+    load_config, parse_markdown_with_frontmatter, parse_permission_target, read_tool_definition,
+    AgentFrontmatter, BeforeTool, CancellationToken, Kind, Observer, Permission, PermissionLevel,
+    PermissionOverride, PermissionResolver, PermissionsConfig, RunConfig, SkillFrontmatter,
+    ToolMiddleware, ToolsConfig,
+};
 use tracing_subscriber::EnvFilter;
 
 /// when true, "ask" permissions are auto-accepted without prompting.
@@ -32,13 +34,14 @@ static TOOL_OUTPUT_TRUNCATE: AtomicUsize = AtomicUsize::new(DEFAULT_TOOL_OUTPUT_
 /// monotonic counter for naming spooled tool-output files this process.
 static SPOOL_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-/// returns the cache dir for spooled output: $XDG_CACHE_HOME/airun/<pid>/
+/// returns the cache dir for spooled output: $XDG_CACHE_HOME/hrns/<pid>/
 /// (falls back to $HOME/.cache, then /tmp).
 fn spool_dir() -> PathBuf {
-    let base = env::var("XDG_CACHE_HOME").map(PathBuf::from)
+    let base = env::var("XDG_CACHE_HOME")
+        .map(PathBuf::from)
         .or_else(|_| env::var("HOME").map(|h| PathBuf::from(h).join(".cache")))
         .unwrap_or_else(|_| PathBuf::from("/tmp"));
-    base.join("airun").join(process::id().to_string())
+    base.join("hrns").join(process::id().to_string())
 }
 
 /// writes `content` to a fresh file under the spool dir, returns its path
@@ -52,372 +55,22 @@ fn write_spool_file(content: &str) -> Option<PathBuf> {
     Some(path)
 }
 
-// --- permissions model (modeled after opencode.ai/docs/permissions) ---
-
-#[derive(Debug, Clone, PartialEq)]
-enum PermissionLevel {
-    Allow,
-    Ask,
-    Deny,
-}
-
-impl<'de> Deserialize<'de> for PermissionLevel {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        match s.as_str() {
-            "allow" => Ok(PermissionLevel::Allow),
-            "ask" => Ok(PermissionLevel::Ask),
-            "deny" => Ok(PermissionLevel::Deny),
-            _ => Err(de::Error::custom(
-                format!("invalid permission level '{}', expected 'allow', 'ask', or 'deny'", s),
-            )),
-        }
-    }
-}
-
-/// a permission can be a single level or a map of glob patterns to levels.
-/// patterns support gitignore-style globs: `*` (non-slash), `**` (any), `?`.
-/// when multiple patterns match, the most specific (fewest wildcards) wins.
-#[derive(Debug, Clone)]
-enum Permission {
-    Level(PermissionLevel),
-    Patterns(HashMap<String, PermissionLevel>),
-}
-
-impl<'de> Deserialize<'de> for Permission {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = serde_yaml::Value::deserialize(deserializer)?;
-        if let serde_yaml::Value::String(s) = &value {
-            match s.as_str() {
-                "allow" => return Ok(Permission::Level(PermissionLevel::Allow)),
-                "ask" => return Ok(Permission::Level(PermissionLevel::Ask)),
-                "deny" => return Ok(Permission::Level(PermissionLevel::Deny)),
-                _ => return Err(de::Error::custom(
-                    format!("invalid permission level '{}', expected 'allow', 'ask', or 'deny'", s),
-                )),
-            }
-        }
-        if let serde_yaml::Value::Mapping(map) = &value {
-            let mut patterns = HashMap::new();
-            for (k, v) in map {
-                let key = k.as_str().ok_or_else(|| {
-                    de::Error::custom(format!("expected string key, got {:?}", k))
-                })?;
-                let level_str = v.as_str().ok_or_else(|| {
-                    de::Error::custom(format!("pattern '{}': expected 'allow', 'ask', or 'deny', got {:?}", key, v))
-                })?;
-                let level = match level_str {
-                    "allow" => PermissionLevel::Allow,
-                    "ask" => PermissionLevel::Ask,
-                    "deny" => PermissionLevel::Deny,
-                    _ => return Err(de::Error::custom(
-                        format!("pattern '{}': invalid permission level '{}', expected 'allow', 'ask', or 'deny'", key, level_str),
-                    )),
-                };
-                patterns.insert(key.to_string(), level);
-            }
-            return Ok(Permission::Patterns(patterns));
-        }
-        Err(de::Error::custom(
-            format!("expected a permission level string or a map of patterns, got {:?}", value),
-        ))
-    }
-}
-
-impl Permission {
-    /// checks the permission level for the given input.
-    /// `path_mode`: when true, `*` stops at `/` boundaries (for file paths).
-    /// when false, `*` matches any character (for commands).
-    fn check(&self, input: &str, path_mode: bool) -> PermissionLevel {
-        match self {
-            Permission::Level(level) => level.clone(),
-            Permission::Patterns(patterns) => {
-                let mut result = PermissionLevel::Deny;
-                let mut best_specificity = 0usize;
-                for (pattern, level) in patterns {
-                    // try the pattern as-is, and also with trailing ` *`/` **`
-                    // stripped so "ls *" also matches "ls" (no args)
-                    let candidates = [
-                        glob_matches(pattern, input, path_mode),
-                        pattern.strip_suffix(" **")
-                            .or_else(|| pattern.strip_suffix(" *"))
-                            .and_then(|prefix| glob_matches(prefix, input, path_mode)),
-                    ];
-                    for specificity in candidates.into_iter().flatten() {
-                        if specificity >= best_specificity {
-                            best_specificity = specificity;
-                            result = level.clone();
-                        }
-                    }
-                }
-                result
-            }
-        }
-    }
-}
-
-/// glob matching with optional path-aware semantics.
-/// `**` always matches any sequence of characters.
-/// in path mode: `*` matches non-`/` chars, `?` matches one non-`/` char.
-/// in command mode: `*` and `?` match any character (including `/`).
-fn glob_matches(pattern: &str, input: &str, path_mode: bool) -> Option<usize> {
-    if glob_matches_recursive(pattern.as_bytes(), input.as_bytes(), path_mode) {
-        let specificity = pattern.len() - pattern.matches('*').count() - pattern.matches('?').count();
-        Some(specificity)
-    } else {
-        None
-    }
-}
-
-fn glob_matches_recursive(pattern: &[u8], input: &[u8], path_mode: bool) -> bool {
-    match (pattern, input) {
-        ([], []) => true,
-        // `**` matches zero or more of anything
-        ([b'*', b'*', rest @ ..], _) => {
-            let rest = skip_stars(rest);
-            for i in 0..=input.len() {
-                if glob_matches_recursive(rest, &input[i..], path_mode) {
-                    return true;
-                }
-            }
-            false
-        }
-        // `*`: in path mode stops at `/`, otherwise matches anything
-        ([b'*', rest @ ..], _) => {
-            let rest = skip_stars(rest);
-            for i in 0..=input.len() {
-                if path_mode && i > 0 && input[i - 1] == b'/' {
-                    break;
-                }
-                if glob_matches_recursive(rest, &input[i..], path_mode) {
-                    return true;
-                }
-            }
-            false
-        }
-        // `?`: in path mode skips non-`/`, otherwise any char
-        ([b'?', rest @ ..], [c, input_rest @ ..]) if !path_mode || *c != b'/' => {
-            glob_matches_recursive(rest, input_rest, path_mode)
-        }
-        ([p, rest @ ..], [c, input_rest @ ..]) if p == c => {
-            glob_matches_recursive(rest, input_rest, path_mode)
-        }
-        _ => false,
-    }
-}
-
-/// skips consecutive `*` characters in a pattern.
-fn skip_stars(pattern: &[u8]) -> &[u8] {
-    let mut p = pattern;
-    while let [b'*', rest @ ..] = p {
-        p = rest;
-    }
-    p
-}
-
-/// looks up `key` in a map keyed by gitignore-style globs. returns the
-/// value of the most-specific matching pattern (longer literal prefix
-/// wins; `"*"` has specificity 0 so it acts as a default). returns
-/// `default` if nothing matches.
-fn glob_lookup<T: Clone>(map: &HashMap<String, T>, key: &str, default: T) -> T {
-    let mut best: Option<(usize, T)> = None;
-    for (pattern, value) in map {
-        if let Some(specificity) = glob_matches(pattern, key, false) {
-            if best.as_ref().is_none_or(|(s, _)| specificity >= *s) {
-                best = Some((specificity, value.clone()));
-            }
-        }
-    }
-    best.map(|(_, v)| v).unwrap_or(default)
-}
-
-#[derive(Deserialize, Debug, Default, Clone)]
-struct PermissionsConfig {
-    #[serde(flatten)]
-    tools: HashMap<String, Permission>,
-}
-
-impl PermissionsConfig {
-    fn merge(self, other: PermissionsConfig) -> PermissionsConfig {
-        let mut merged = self.tools;
-        merged.extend(other.tools);
-        PermissionsConfig { tools: merged }
-    }
-
-    /// applies CLI-style overrides on top of self with pattern-level
-    /// granularity. for each override:
-    ///   - a bare `TOOL=LEVEL` replaces the tool entry entirely.
-    ///   - a `TOOL:PATTERN=LEVEL` merges into the tool's pattern map; if the
-    ///     existing entry was a single level, it is first promoted to a
-    ///     pattern map with `**` mapped to the old level.
-    fn apply_overrides(mut self, overrides: &[PermissionOverride]) -> Self {
-        for ov in overrides {
-            match &ov.pattern {
-                None => {
-                    self.tools.insert(ov.tool.clone(), Permission::Level(ov.level.clone()));
-                }
-                Some(pat) => {
-                    let existing = self.tools.remove(&ov.tool);
-                    let mut patterns = match existing {
-                        Some(Permission::Patterns(map)) => map,
-                        Some(Permission::Level(lvl)) => {
-                            let mut m = HashMap::new();
-                            m.insert("**".to_string(), lvl);
-                            m
-                        }
-                        None => HashMap::new(),
-                    };
-                    patterns.insert(pat.clone(), ov.level.clone());
-                    self.tools.insert(ov.tool.clone(), Permission::Patterns(patterns));
-                }
-            }
-        }
-        self
-    }
-
-    fn check(&self, tool_name: &str, input: &str, path_mode: bool) -> PermissionLevel {
-        // outer lookup: glob match on tool name (so `"*" = "deny"` works
-        // as a default). most-specific match wins; missing entries default
-        // to deny. inner pattern matching is delegated to `Permission::check`.
-        let mut best: Option<(usize, &Permission)> = None;
-        for (pattern, perm) in &self.tools {
-            if let Some(specificity) = glob_matches(pattern, tool_name, false) {
-                if best.as_ref().is_none_or(|(s, _)| specificity >= *s) {
-                    best = Some((specificity, perm));
-                }
-            }
-        }
-        best.map(|(_, p)| p.check(input, path_mode))
-            .unwrap_or(PermissionLevel::Deny)
-    }
-}
-
-/// a single CLI permission override, built from `--permissions-{allow,ask,deny}`.
-/// shapes for the flag value:
-///   `TOOL`                   -> pattern is None (replaces tool entry)
-///   `TOOL:PATTERN`           -> pattern merges into the tool's map
-#[derive(Debug, Clone)]
-struct PermissionOverride {
-    tool: String,
-    pattern: Option<String>,
-    level: PermissionLevel,
-}
-
-/// parses the `TOOL` or `TOOL:PATTERN` value (without the level, which is
-/// supplied by which flag was used).
-fn parse_permission_target(s: &str) -> Result<(String, Option<String>), String> {
-    let (tool, pattern) = match s.split_once(':') {
-        Some((t, p)) => (t.trim().to_string(), Some(p.to_string())),
-        None => (s.trim().to_string(), None),
-    };
-    if tool.is_empty() {
-        return Err(format!("invalid permission target '{}': empty tool name", s));
-    }
-    Ok((tool, pattern))
-}
-
-#[derive(Deserialize, Debug, Default, Clone)]
-struct ToolsConfig {
-    #[serde(flatten)]
-    tools: HashMap<String, bool>,
-}
-
-impl ToolsConfig {
-    fn merge(self, other: ToolsConfig) -> ToolsConfig {
-        let mut merged = self.tools;
-        merged.extend(other.tools);
-        ToolsConfig { tools: merged }
-    }
-
-    /// checks if a tool is active. if `tools_override` is Some, only
-    /// the listed tools are enabled (ignoring config). otherwise, looks up
-    /// the tool in the config map using gitignore-style glob matching
-    /// (most specific wins, `"*"` acts as a default). default: false.
-    fn is_active(&self, tool_name: &str, tools_override: &Option<Vec<String>>) -> bool {
-        match tools_override {
-            Some(list) => list.iter().any(|t| t == tool_name),
-            None => glob_lookup(&self.tools, tool_name, false),
-        }
-    }
-}
-
-/// gates which hook scripts are loaded, keyed by the hook's declared
-/// `name` (returned in `discover`, defaulting to the file stem). same
-/// glob semantics as `[tools]`: `"*" = false` is the default.
-#[derive(Deserialize, Debug, Default, Clone)]
-struct HooksConfig {
-    #[serde(flatten)]
-    hooks: HashMap<String, bool>,
-}
-
-impl HooksConfig {
-    /// checks if a hook is active. if `hooks_override` is Some, only the
-    /// listed hooks are enabled (ignoring config). otherwise, looks up
-    /// the hook in config with glob semantics.
-    fn is_active(&self, hook_name: &str, hooks_override: &Option<Vec<String>>) -> bool {
-        match hooks_override {
-            Some(list) => list.iter().any(|h| h == hook_name),
-            None => glob_lookup(&self.hooks, hook_name, false),
-        }
-    }
-}
-
-/// gates which skills are loadable. keyed by skill name (the file stem
-/// passed to `load_skill`). same glob semantics as `[tools]`.
-#[derive(Deserialize, Debug, Default, Clone)]
-struct SkillsConfig {
-    #[serde(flatten)]
-    skills: HashMap<String, bool>,
-}
-
-impl SkillsConfig {
-    fn is_active(&self, skill_name: &str) -> bool {
-        glob_lookup(&self.skills, skill_name, false)
-    }
-}
-
-// --- read tool ---
-
-#[derive(Deserialize)]
-struct ReadArgs {
-    path: String,
-    /// 0-indexed line number to start reading from (default: 0)
-    #[serde(default)]
-    offset: Option<usize>,
-    /// number of lines to read (default: read to end)
-    #[serde(default)]
-    count: Option<usize>,
-}
-
-/// returns a slice of `content` covering `count` lines starting at the
-/// 0-indexed `offset`. if both are None, returns the input unchanged.
-fn slice_lines(content: &str, offset: Option<usize>, count: Option<usize>) -> String {
-    if offset.is_none() && count.is_none() {
-        return content.to_string();
-    }
-    let start = offset.unwrap_or(0);
-    let lines: Vec<&str> = content.lines().collect();
-    let end = match count {
-        Some(n) => (start + n).min(lines.len()),
-        None => lines.len(),
-    };
-    if start >= lines.len() {
-        return String::new();
-    }
-    lines[start..end].join("\n")
-}
-
-/// prompts the user for confirmation via /dev/tty (bypassing stdin which
-/// may be piped). returns true immediately if --yes flag is set.
 fn prompt_user_confirmation(tool_name: &str, input: &str) -> bool {
     if AUTO_ACCEPT.load(Ordering::Relaxed) {
         eprintln!("auto-accepting: {} \"{}\"", tool_name, input);
         return true;
     }
-    let tty = match fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
+    let tty = match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+    {
         Ok(f) => f,
         Err(_) => {
-            eprintln!("cannot open /dev/tty for confirmation, denying: {} {}", tool_name, input);
+            eprintln!(
+                "cannot open /dev/tty for confirmation, denying: {} {}",
+                tool_name, input
+            );
             return false;
         }
     };
@@ -432,125 +85,6 @@ fn prompt_user_confirmation(tool_name: &str, input: &str) -> bool {
     matches!(response.trim(), "y" | "Y" | "yes" | "YES")
 }
 
-/// checks permission for a tool invocation, returning Ok(()) or a ToolError.
-/// `path_mode`: true for file-path tools (read), false for command tools (bash).
-fn check_tool_permission(
-    permissions: &PermissionsConfig,
-    tool_name: &str,
-    input: &str,
-    path_mode: bool,
-) -> Result<(), ToolError> {
-    match permissions.check(tool_name, input, path_mode) {
-        PermissionLevel::Allow => Ok(()),
-        PermissionLevel::Ask => {
-            if prompt_user_confirmation(tool_name, input) {
-                Ok(())
-            } else {
-                Err(ToolError::ToolCallError(
-                    format!("permission denied (user rejected): {}", input).into(),
-                ))
-            }
-        }
-        PermissionLevel::Deny => {
-            Err(ToolError::ToolCallError(
-                format!("permission denied: {}", input).into(),
-            ))
-        }
-    }
-}
-
-struct ReadTool {
-    permissions: PermissionsConfig,
-    hooks: Arc<HookManager>,
-}
-
-fn read_tool_definition() -> ToolDefinition {
-    ToolDefinition {
-        name: "read".to_string(),
-        description: "read the contents of a file".to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "absolute or relative path to the file to read"
-                },
-                "offset": {
-                    "type": "integer",
-                    "description": "0-indexed line number to start reading from (default: 0)",
-                    "minimum": 0
-                },
-                "count": {
-                    "type": "integer",
-                    "description": "number of lines to read (default: read to end)",
-                    "minimum": 1
-                }
-            },
-            "required": ["path"]
-        }),
-    }
-}
-
-impl Tool for ReadTool {
-    const NAME: &'static str = "read";
-    type Error = ToolError;
-    type Args = ReadArgs;
-    type Output = String;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        read_tool_definition()
-    }
-
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let resolved = resolve_path(&args.path);
-        let path_str = resolved.to_string_lossy().into_owned();
-        check_tool_permission(&self.permissions, "read", &path_str, true)?;
-
-        let call_id = next_call_id();
-        let args_json = serde_json::json!({"path": args.path});
-        let before = self.hooks.before_tool("read", &call_id, &args_json);
-        if let Some(reason) = before.deny {
-            return Err(ToolError::ToolCallError(format!("denied by hook: {}", reason).into()));
-        }
-
-        let result = if let Some(synthetic) = before.result {
-            synthetic
-        } else {
-            let content = fs::read_to_string(&resolved)
-                .map(|c| slice_lines(&c, args.offset, args.count))
-                .map_err(|e| {
-                    ToolError::ToolCallError(format!("{}: {}", path_str, e).into())
-                })?;
-            serde_json::to_string(&serde_json::json!({"content": content}))
-                .expect("serialize read result")
-        };
-        let after = self.hooks.after_tool("read", &call_id, &result);
-        Ok(after.result.unwrap_or(result))
-    }
-}
-
-// --- bash tool ---
-
-/// shell metacharacters that could chain or redirect commands.
-const SHELL_METACHARACTERS: &[char] = &[';', '|', '&', '`', '$', '(', ')', '{', '}', '<', '>', '\n', '\r', '!', '#'];
-
-/// returns true if the command is a simple command without shell
-/// metacharacters that could bypass permission checks.
-fn is_simple_bash_command(command: &str) -> bool {
-    !command.contains('\\') && !command.chars().any(|c| SHELL_METACHARACTERS.contains(&c))
-}
-
-#[derive(Deserialize)]
-struct BashArgs {
-    command: String,
-}
-
-struct BashTool {
-    permissions: PermissionsConfig,
-    hooks: Arc<HookManager>,
-}
-
-/// renders a `ToolDefinition` as an OpenAI chat-completions tool entry.
 fn tool_def_as_function(def: &ToolDefinition) -> serde_json::Value {
     serde_json::json!({
         "type": "function",
@@ -560,107 +94,6 @@ fn tool_def_as_function(def: &ToolDefinition) -> serde_json::Value {
             "parameters": def.parameters,
         }
     })
-}
-
-fn bash_tool_definition() -> ToolDefinition {
-    ToolDefinition {
-        name: "bash".to_string(),
-        description: "execute a bash command and return its output".to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "the bash command to execute. must be simple: no pipes, redirects, chaining, or shell metacharacters"
-                }
-            },
-            "required": ["command"]
-        }),
-    }
-}
-
-/// monotonic counter for `before_tool`/`after_tool` correlation ids.
-static CALL_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn next_call_id() -> String {
-    let n = CALL_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("airun-{}-{}", std::process::id(), n)
-}
-
-impl Tool for BashTool {
-    const NAME: &'static str = "bash";
-    type Error = ToolError;
-    type Args = BashArgs;
-    type Output = String;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        bash_tool_definition()
-    }
-
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        if is_simple_bash_command(&args.command) {
-            check_tool_permission(&self.permissions, "bash", &args.command, false)?;
-        } else {
-            // command contains shell metacharacters, so we can't trust pattern
-            // matching on the full string, so fall back to the catch-all rule.
-            // use an empty string to only match wildcard patterns.
-            let level = self.permissions.check("bash", "", false);
-            match level {
-                PermissionLevel::Allow => {}
-                PermissionLevel::Ask => {
-                    if !prompt_user_confirmation("bash (complex)", &args.command) {
-                        return Err(ToolError::ToolCallError(
-                            format!("permission denied (user rejected): {}", args.command).into(),
-                        ));
-                    }
-                }
-                PermissionLevel::Deny => {
-                    return Err(ToolError::ToolCallError(
-                        format!("permission denied (shell metacharacters): {}", args.command).into(),
-                    ));
-                }
-            }
-        }
-        let call_id = next_call_id();
-        let args_json = serde_json::json!({"command": args.command});
-        let before = self.hooks.before_tool("bash", &call_id, &args_json);
-        if let Some(reason) = before.deny {
-            return Err(ToolError::ToolCallError(format!("denied by hook: {}", reason).into()));
-        }
-
-        let result = if let Some(synthetic) = before.result {
-            synthetic
-        } else {
-            let output = process::Command::new("sh")
-                .arg("-c")
-                .arg(&args.command)
-                .output()
-                .map_err(|e| {
-                    ToolError::ToolCallError(format!("failed to execute: {}", e).into())
-                })?;
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let mut obj = serde_json::Map::new();
-            obj.insert("exit_code".into(), serde_json::json!(output.status.code().unwrap_or(-1)));
-            obj.insert("stdout".into(), serde_json::json!(stdout));
-            if !stderr.is_empty() {
-                obj.insert("stderr".into(), serde_json::json!(stderr));
-            }
-            serde_json::to_string(&serde_json::Value::Object(obj))
-                .expect("serialize bash result")
-        };
-        let after = self.hooks.after_tool("bash", &call_id, &result);
-        Ok(after.result.unwrap_or(result))
-    }
-}
-
-fn resolve_path(path: &str) -> PathBuf {
-    let p = Path::new(path);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(p)
-    }
 }
 
 const DEFAULT_MAX_TOKENS: u64 = 16384;
@@ -767,168 +200,6 @@ struct Args {
     verbose: bool,
 }
 
-#[derive(Deserialize, Debug, Default, Clone)]
-struct ProviderConfig {
-    name: String,
-    /// openai (responses API), openai_completions, anthropic, gemini, cohere, xai
-    client: Option<String>,
-    api_key: Option<String>,
-    base_url: Option<String>,
-}
-
-#[derive(Deserialize, Debug, Default)]
-struct Config {
-    default_model: Option<String>,
-    default_max_tokens: Option<u64>,
-    default_max_turns: Option<usize>,
-    /// fallback system prompt used when no `-s` flag and no agent body
-    default_system_prompt: Option<String>,
-    /// max bytes of tool-call output rendered to stderr (default: 2000)
-    tool_output_truncate: Option<usize>,
-    #[serde(default)]
-    tools: ToolsConfig,
-    #[serde(default, alias = "permission")]
-    permissions: PermissionsConfig,
-    #[serde(default)]
-    hooks: HooksConfig,
-    #[serde(default)]
-    skills: SkillsConfig,
-    #[serde(default)]
-    providers: Vec<ProviderConfig>,
-}
-
-#[derive(Deserialize, Debug, Default)]
-struct AgentFrontmatter {
-    description: Option<String>,
-    model: Option<String>,
-    skills: Option<Vec<String>>,
-    #[serde(default)]
-    tools: ToolsConfig,
-    #[serde(default, alias = "permission")]
-    permissions: PermissionsConfig,
-}
-
-struct ParsedDoc<T> {
-    frontmatter: T,
-    body: String,
-}
-
-#[derive(Deserialize, Debug, Default)]
-struct SkillFrontmatter {
-    description: Option<String>,
-}
-
-fn parse_markdown_with_frontmatter<T: serde::de::DeserializeOwned + Default>(
-    content: &str,
-) -> Result<ParsedDoc<T>, Box<dyn std::error::Error>> {
-    if content.starts_with("---\n") || content.starts_with("---\r\n") {
-        if let Some(end_idx) = content[4..].find("\n---") {
-            let frontmatter_str = &content[4..end_idx + 4];
-            let body_start = end_idx + 4 + 4;
-            let body_start = if content.len() > body_start && content[body_start..].starts_with('\n') {
-                body_start + 1
-            } else if content.len() > body_start + 1 && content[body_start..].starts_with("\r\n") {
-                body_start + 2
-            } else {
-                body_start
-            };
-
-            let frontmatter: T = serde_yaml::from_str(frontmatter_str)?;
-            let body = content[body_start..].to_string();
-            return Ok(ParsedDoc { frontmatter, body });
-        }
-    }
-    Ok(ParsedDoc {
-        frontmatter: T::default(),
-        body: content.to_string(),
-    })
-}
-
-/// distinguishes agent vs. skill lookup so the search can pick the right
-/// per-base subdirectories (e.g. `.pi/agent/prompts` for agents but
-/// `.pi/agent/skills` for skills).
-#[derive(Copy, Clone)]
-enum Kind { Agent, Skill }
-
-/// flat fallback bases tried at each cwd-walk level after kind-specific
-/// subdirs. these allow loose layouts like `.agents/foo.md` to work for
-/// `load_*` but they are NOT enumerated for `--list-*`.
-const FLAT_LOCAL_BASES: &[&str] = &[".opencode", ".claude", ".agents"];
-
-/// kind-specific subdir suffixes searched relative to the cwd-walk parent.
-fn local_subdirs(kind: Kind) -> &'static [&'static str] {
-    match kind {
-        Kind::Agent => &[
-            ".opencode/agents",
-            ".claude/agents",
-            ".agents/agents",
-        ],
-        Kind::Skill => &[
-            ".opencode/skills",
-            ".claude/skills",
-            ".agents/skills",
-            ".pi/agent/skills",
-        ],
-    }
-}
-
-/// kind-specific global search dirs (already absolute, $HOME-anchored).
-fn global_subdirs(kind: Kind) -> Vec<PathBuf> {
-    let Ok(home) = env::var("HOME") else { return Vec::new(); };
-    let h = PathBuf::from(home);
-    match kind {
-        Kind::Agent => vec![
-            h.join(".config/opencode/agents"),
-            h.join(".claude/agents"),
-            h.join(".agents/agents"),
-        ],
-        Kind::Skill => vec![
-            h.join(".config/opencode/skills"),
-            h.join(".claude/skills"),
-            h.join(".agents/skills"),
-            h.join(".pi/agent/skills"),
-        ],
-    }
-}
-
-/// flat global bases tried after kind-specific globals (lookup only).
-fn flat_global_bases() -> Vec<PathBuf> {
-    let Ok(home) = env::var("HOME") else { return Vec::new(); };
-    let h = PathBuf::from(home);
-    vec![
-        h.join(".config/opencode"),
-        h.join(".claude"),
-        h.join(".agents"),
-    ]
-}
-
-fn find_file_in_dirs(kind: Kind, filename: &str) -> Option<PathBuf> {
-    // walk up from current dir, retrying kind-specific + flat fallbacks
-    let mut current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    loop {
-        for sub in local_subdirs(kind) {
-            let path = current_dir.join(sub).join(filename);
-            if path.exists() { return Some(path); }
-        }
-        for base in FLAT_LOCAL_BASES {
-            let path = current_dir.join(base).join(filename);
-            if path.exists() { return Some(path); }
-        }
-        if current_dir.join(".git").exists() { break; }
-        if !current_dir.pop() { break; }
-    }
-
-    for d in global_subdirs(kind) {
-        let path = d.join(filename);
-        if path.exists() { return Some(path); }
-    }
-    for d in flat_global_bases() {
-        let path = d.join(filename);
-        if path.exists() { return Some(path); }
-    }
-    None
-}
-
 /// prints rows as a padded table with 2-space column gaps.
 /// shortens a filesystem path for display: relative to cwd when the
 /// path is under it, else `~/...` when under $HOME, else the absolute
@@ -949,23 +220,38 @@ fn shorten_path(path: &Path) -> String {
 }
 
 fn print_table(header: Option<&[&str]>, rows: &[Vec<&str>]) {
-    if rows.is_empty() && header.is_none() { return; }
-    let cols = header.map(|h| h.len()).into_iter()
+    if rows.is_empty() && header.is_none() {
+        return;
+    }
+    let cols = header
+        .map(|h| h.len())
+        .into_iter()
         .chain(rows.iter().map(|r| r.len()))
-        .max().unwrap_or(0);
-    let widths: Vec<usize> = (0..cols).map(|c| {
-        let header_w = header.and_then(|h| h.get(c)).map_or(0, |s| s.len());
-        let rows_w = rows.iter().map(|r| r.get(c).map_or(0, |s| s.len())).max().unwrap_or(0);
-        header_w.max(rows_w)
-    }).collect();
+        .max()
+        .unwrap_or(0);
+    let widths: Vec<usize> = (0..cols)
+        .map(|c| {
+            let header_w = header.and_then(|h| h.get(c)).map_or(0, |s| s.len());
+            let rows_w = rows
+                .iter()
+                .map(|r| r.get(c).map_or(0, |s| s.len()))
+                .max()
+                .unwrap_or(0);
+            header_w.max(rows_w)
+        })
+        .collect();
     let print_row = |row: &[&str]| {
-        let line: Vec<String> = row.iter().enumerate().map(|(i, val)| {
-            if i + 1 < row.len() {
-                format!("{:<width$}", val, width = widths[i])
-            } else {
-                val.to_string()
-            }
-        }).collect();
+        let line: Vec<String> = row
+            .iter()
+            .enumerate()
+            .map(|(i, val)| {
+                if i + 1 < row.len() {
+                    format!("{:<width$}", val, width = widths[i])
+                } else {
+                    val.to_string()
+                }
+            })
+            .collect();
         println!("{}", line.join("  "));
     };
     if let Some(h) = header {
@@ -1000,355 +286,70 @@ fn print_permissions(perms: &PermissionsConfig) {
     for tool in tools {
         match &perms.tools[tool] {
             Permission::Level(lvl) => {
-                rows.push(vec![tool.clone(), String::new(), permission_level_str(lvl).to_string()]);
+                rows.push(vec![
+                    tool.clone(),
+                    String::new(),
+                    permission_level_str(lvl).to_string(),
+                ]);
             }
             Permission::Patterns(map) => {
                 let mut entries: Vec<(&String, &PermissionLevel)> = map.iter().collect();
                 // most specific first (fewest wildcards, then longer pattern,
                 // then alphabetical for stable output)
                 entries.sort_by(|a, b| {
-                    pattern_wildcards(a.0).cmp(&pattern_wildcards(b.0))
+                    pattern_wildcards(a.0)
+                        .cmp(&pattern_wildcards(b.0))
                         .then(b.0.len().cmp(&a.0.len()))
                         .then(a.0.cmp(b.0))
                 });
                 for (i, (pat, lvl)) in entries.iter().enumerate() {
                     let name = if i == 0 { tool.clone() } else { String::new() };
-                    rows.push(vec![name, (*pat).clone(), permission_level_str(lvl).to_string()]);
+                    rows.push(vec![
+                        name,
+                        (*pat).clone(),
+                        permission_level_str(lvl).to_string(),
+                    ]);
                 }
             }
         }
     }
-    let row_refs: Vec<Vec<&str>> = rows.iter().map(|r| r.iter().map(|s| s.as_str()).collect()).collect();
+    let row_refs: Vec<Vec<&str>> = rows
+        .iter()
+        .map(|r| r.iter().map(|s| s.as_str()).collect())
+        .collect();
     print_table(Some(&["tool", "pattern", "level"]), &row_refs);
-}
-
-/// finds all .md files in kind-specific subdirs across all base directories.
-/// returns (name, path) pairs with the `.md` extension stripped. flat
-/// fallback bases are not enumerated here, only structured subdirs.
-fn find_all_in_dirs(kind: Kind) -> Vec<(String, PathBuf)> {
-    let mut results = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    let mut collect_from = |search_dir: &Path| {
-        if let Ok(entries) = fs::read_dir(search_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() && path.join("SKILL.md").exists() {
-                    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                        let name = name.to_string();
-                        if seen.insert(name.clone()) {
-                            results.push((name, path.join("SKILL.md")));
-                        }
-                    }
-                } else if path.extension().is_some_and(|e| e == "md") {
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        let name = stem.to_string();
-                        if seen.insert(name.clone()) {
-                            results.push((name, path));
-                        }
-                    }
-                }
-            }
-        }
-    };
-
-    let mut current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    loop {
-        for sub in local_subdirs(kind) {
-            collect_from(&current_dir.join(sub));
-        }
-        if current_dir.join(".git").exists() { break; }
-        if !current_dir.pop() { break; }
-    }
-
-    for d in global_subdirs(kind) {
-        collect_from(&d);
-    }
-
-    results.sort_by(|a, b| a.0.cmp(&b.0));
-    results
-}
-
-fn load_agent(agent_name: &str) -> Result<ParsedDoc<AgentFrontmatter>, Box<dyn std::error::Error>> {
-    let filename = format!("{}.md", agent_name);
-    let path = find_file_in_dirs(Kind::Agent, &filename).ok_or_else(|| {
-        format!("agent '{}' not found in .opencode/, .claude/, or .agents/ directories", agent_name)
-    })?;
-    
-    let content = fs::read_to_string(&path)?;
-    parse_markdown_with_frontmatter(&content)
-        .map_err(|e| format!("agent '{}' ({}): {}", agent_name, path.display(), e).into())
-}
-
-fn load_skill(skill_name: &str) -> Result<ParsedDoc<SkillFrontmatter>, Box<dyn std::error::Error>> {
-    let filename_md = format!("{}.md", skill_name);
-    let filename_skill_md = format!("{}/SKILL.md", skill_name);
-    
-    let path = find_file_in_dirs(Kind::Skill, &filename_skill_md)
-        .or_else(|| find_file_in_dirs(Kind::Skill, &filename_md))
-        .ok_or_else(|| {
-            format!("skill '{}' not found in .opencode/, .claude/, .agents/, or .pi/agent/ directories", skill_name)
-        })?;
-    
-    let content = fs::read_to_string(&path)?;
-    parse_markdown_with_frontmatter(&content)
-        .map_err(|e| format!("skill '{}' ({}): {}", skill_name, path.display(), e).into())
-}
-
-fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
-    let config_paths = [
-        "airun.toml",
-        ".airun.toml",
-        ".config/airun.toml",
-        "~/.config/airun/config.toml",
-    ];
-
-    let mut config_content = String::new();
-    for path_str in config_paths {
-        let path = if let Some(stripped) = path_str.strip_prefix("~/") {
-            if let Ok(home) = env::var("HOME") {
-                PathBuf::from(home).join(stripped)
-            } else {
-                continue;
-            }
-        } else {
-            PathBuf::from(path_str)
-        };
-
-        if path.exists() {
-            config_content = fs::read_to_string(path)?;
-            break;
-        }
-    }
-
-    if config_content.is_empty() {
-        return Ok(Config::default());
-    }
-
-    let config: Config = toml::from_str(&config_content)?;
-    Ok(config)
 }
 
 fn init_config() -> Result<(), Box<dyn std::error::Error>> {
     let home = env::var("HOME").map_err(|_| "HOME environment variable not set")?;
-    let config_dir = PathBuf::from(home).join(".config").join("airun");
-    
+    let config_dir = PathBuf::from(home).join(".config").join("hrns");
+
     if !config_dir.exists() {
         fs::create_dir_all(&config_dir)?;
         println!("created directory: {}", config_dir.display());
     }
-    
+
     let config_path = config_dir.join("config.toml");
-    
+
     if config_path.exists() {
-        eprintln!("configuration file already exists at: {}", config_path.display());
+        eprintln!(
+            "configuration file already exists at: {}",
+            config_path.display()
+        );
         return Ok(());
     }
 
-    let default_config = include_str!("../airun.example.toml");
+    let default_config = include_str!("../hrns.example.toml");
 
     fs::write(&config_path, default_config)?;
     println!("initialized configuration at: {}", config_path.display());
     Ok(())
 }
 
-macro_rules! stream_agent {
-    ($agent:expr, $user_prompt:expr) => {{
-        let mut stream = $agent.stream_prompt($user_prompt).await;
-        let mut stdout = io::stdout();
-        let mut stderr = io::stderr();
-        let mut in_reasoning = false;
-        // track loop exit cause for the before_stop hook. a natural drain
-        // is reported as "stop"; a stream Err becomes "error" with the
-        // message. max_turns is not currently distinguishable from "stop"
-        // without rig exposing it.
-        let mut __exit_reason: &'static str = "stop";
-        let mut __exit_error: Option<String> = None;
-        while let Some(chunk_result) = stream.next().await {
-            macro_rules! end_reasoning {
-                () => {
-                    if in_reasoning {
-                        stderr.write_all(b"\n")?;
-                        stderr.flush()?;
-                        in_reasoning = false;
-                    }
-                };
-            }
-            match chunk_result {
-                Ok(rig::agent::MultiTurnStreamItem::StreamAssistantItem(
-                    rig::streaming::StreamedAssistantContent::Text(t)
-                )) => {
-                    end_reasoning!();
-                    stdout.write_all(t.text.as_bytes())?;
-                    stdout.flush()?;
-                }
-                Ok(rig::agent::MultiTurnStreamItem::StreamAssistantItem(
-                    rig::streaming::StreamedAssistantContent::ReasoningDelta { reasoning, .. }
-                )) => {
-                    if !QUIET.load(Ordering::Relaxed) {
-                        stderr.write_all(b"\x1b[2;3m")?;
-                        stderr.write_all(reasoning.as_bytes())?;
-                        stderr.write_all(b"\x1b[0m")?;
-                        stderr.flush()?;
-                        in_reasoning = true;
-                    }
-                }
-                Ok(rig::agent::MultiTurnStreamItem::StreamAssistantItem(
-                    rig::streaming::StreamedAssistantContent::ToolCall { tool_call, .. }
-                )) => {
-                    end_reasoning!();
-                    if !QUIET.load(Ordering::Relaxed) {
-                        write!(stderr, "\x1b[1;36m{}\x1b[0m\x1b[2m({})\x1b[0m\n",
-                            tool_call.function.name, tool_call.function.arguments)?;
-                        stderr.flush()?;
-                    }
-                }
-                Ok(rig::agent::MultiTurnStreamItem::StreamUserItem(
-                    rig::streaming::StreamedUserContent::ToolResult { tool_result, .. }
-                )) => {
-                    end_reasoning!();
-                    if !QUIET.load(Ordering::Relaxed) {
-                        let result_text: String = tool_result.content.iter()
-                            .filter_map(|c| match c {
-                                rig::message::ToolResultContent::Text(t) => Some(t.text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("");
-                        let limit = TOOL_OUTPUT_TRUNCATE.load(Ordering::Relaxed);
-                        if limit > 0 && result_text.len() > limit {
-                            // slice on a char boundary <= limit
-                            let mut cut = limit.min(result_text.len());
-                            while !result_text.is_char_boundary(cut) { cut -= 1; }
-                            let head = &result_text[..cut];
-                            let total = result_text.len();
-                            let spool = write_spool_file(&result_text);
-                            write!(stderr, "\x1b[2m  -> {}\x1b[0m\n",
-                                head.replace('\n', "\\n"))?;
-                            match spool {
-                                Some(p) => write!(stderr,
-                                    "\x1b[33m  ! truncated tool output: {} of {} bytes shown. full content at {} (read with: cat {})\x1b[0m\n",
-                                    cut, total, p.display(), p.display())?,
-                                None => write!(stderr,
-                                    "\x1b[33m  ! truncated tool output: {} of {} bytes shown (failed to spool full content)\x1b[0m\n",
-                                    cut, total)?,
-                            }
-                        } else {
-                            write!(stderr, "\x1b[2m  -> {}\x1b[0m\n", result_text.replace('\n', "\\n"))?;
-                        }
-                        stderr.flush()?;
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("stream error: {}", e);
-                    __exit_reason = "error";
-                    __exit_error = Some(format!("{}", e));
-                    break;
-                }
-            }
-        }
-        if in_reasoning {
-            stderr.write_all(b"\n")?;
-            stderr.flush()?;
-        }
-        (__exit_reason, __exit_error)
-    }};
-}
-
-/// builds and streams an agent, conditionally adding tools based on config.
-/// uses a macro because `.tool()` changes the builder's type parameter.
-macro_rules! build_and_stream {
-    (client: $client:expr, $model_name:expr, $max_tokens:expr, $max_turns:expr, $tools:expr, $tools_override:expr, $permissions:expr, $hooks:expr, $system_prompt:expr, $user_prompt:expr) => {{
-        let mut builder = $client.agent($model_name).max_tokens($max_tokens).default_max_turns($max_turns);
-        if !$system_prompt.is_empty() {
-            builder = builder.preamble($system_prompt);
-        }
-        add_tools_and_stream!(builder, $tools, $tools_override, $permissions, $hooks, $user_prompt);
-    }};
-    (model: $model:expr, $max_tokens:expr, $max_turns:expr, $tools:expr, $tools_override:expr, $permissions:expr, $hooks:expr, $system_prompt:expr, $user_prompt:expr) => {{
-        let mut builder = rig::agent::AgentBuilder::new($model).max_tokens($max_tokens).default_max_turns($max_turns);
-        if !$system_prompt.is_empty() {
-            builder = builder.preamble($system_prompt);
-        }
-        add_tools_and_stream!(builder, $tools, $tools_override, $permissions, $hooks, $user_prompt);
-    }};
-}
-
-/// adds built-in tools (gated by `tools` config) plus all hook-registered
-/// dynamic tools, then streams the agent.
-macro_rules! add_tools_and_stream {
-    ($builder:expr, $tools:expr, $tools_override:expr, $permissions:expr, $hooks:expr, $user_prompt:expr) => {{
-        let has_read = $tools.is_active("read", $tools_override);
-        let has_bash = $tools.is_active("bash", $tools_override);
-        // hook-registered tools are gated by [tools] (matched on the
-        // tool's full_name, e.g. `datetime_now`) in addition to the
-        // [hooks] gate that decided which scripts to discover at all.
-        let dyn_hook_tools: Vec<Box<dyn rig::tool::ToolDyn>> = $hooks.into_dyn_tools($permissions)
-            .into_iter()
-            .filter(|t| $tools.is_active(&rig::tool::ToolDyn::name(t.as_ref()), $tools_override))
-            .collect();
-        let builder = $builder.tools(dyn_hook_tools);
-        let builder = if has_read {
-            builder.tool(ReadTool { permissions: $permissions.clone(), hooks: $hooks.clone() })
-        } else {
-            builder
-        };
-        let builder = if has_bash {
-            builder.tool(BashTool { permissions: $permissions.clone(), hooks: $hooks.clone() })
-        } else {
-            builder
-        };
-        let agent = builder.build();
-        let (__exit_reason, __exit_error) = stream_agent!(agent, $user_prompt);
-        // tier 1: notify hooks that the loop has terminated. observational
-        // only; `continue` responses are accepted in the wire format but
-        // not honored (no re-entry), so `final` is always true.
-        $hooks.before_stop(__exit_reason, __exit_error.as_deref());
-    }};
-}
-
-/// appends skill contents to a system prompt. skills not enabled by
-/// `config` are skipped with a warning.
-fn append_skills(system_prompt: &mut String, skill_names: &[String], config: &SkillsConfig) {
-    let allowed: Vec<&String> = skill_names.iter().filter(|n| {
-        if config.is_active(n) {
-            true
-        } else {
-            eprintln!("warning: skill '{}' disabled by config", n);
-            false
-        }
-    }).collect();
-    if allowed.is_empty() {
-        return;
-    }
-    system_prompt.push_str("\n\n# skills\n");
-    for skill_name in allowed {
-        match load_skill(skill_name) {
-            Ok(skill) => {
-                system_prompt.push_str(&format!("\n## {}\n", skill_name));
-                if let Some(desc) = skill.frontmatter.description {
-                    system_prompt.push_str(&format!("description: {}\n", desc));
-                }
-                system_prompt.push_str(&format!("{}\n", skill.body));
-            }
-            Err(e) => {
-                eprintln!("warning: failed to load skill '{}': {}", skill_name, e);
-            }
-        }
-    }
-}
-
-fn build_system_prompt(agent: &ParsedDoc<AgentFrontmatter>, skills_config: &SkillsConfig) -> String {
-    let mut system_prompt = agent.body.clone();
-    if let Some(skills) = &agent.frontmatter.skills {
-        append_skills(&mut system_prompt, skills, skills_config);
-    }
-    system_prompt
-}
-
 fn get_user_prompt(args: &Args) -> Result<String, Box<dyn std::error::Error>> {
-    let mut user_prompt = args.prompt.clone()
+    let mut user_prompt = args
+        .prompt
+        .clone()
         .or_else(|| args.prompt_positional.clone())
         .unwrap_or_default();
     if user_prompt.is_empty() && !io::stdin().is_terminal() {
@@ -1362,84 +363,158 @@ fn get_user_prompt(args: &Args) -> Result<String, Box<dyn std::error::Error>> {
     Ok(user_prompt)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_agent_stream(
-    client_type: &str,
-    model_name: &str,
-    api_key: &str,
-    base_url: Option<String>,
-    max_tokens: u64,
-    max_turns: usize,
-    tools: &ToolsConfig,
-    tools_override: &Option<Vec<String>>,
-    permissions: &PermissionsConfig,
-    hooks: &Arc<HookManager>,
-    system_prompt: &str,
-    user_prompt: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // rig's typestate builder requires .api_key() before .build(); when no
-    // key is configured, pass a placeholder so local openai-compatible
-    // servers (which ignore the auth header) still work. hosted providers
-    // will return a clear auth error from upstream at request time.
-    let api_key = if api_key.is_empty() { "none" } else { api_key };
+/// the CLI's permission resolver: prompts on /dev/tty via
+/// `prompt_user_confirmation` (bypassable with --yes).
+struct TtyResolver;
 
-    macro_rules! build_openai_client {
-        () => {{
-            let mut builder = providers::openai::Client::builder().api_key(api_key);
-            if let Some(url) = base_url {
-                builder = builder.base_url(&url);
-            }
-            builder.build().expect("failed to build OpenAI client")
-        }};
+#[async_trait]
+impl PermissionResolver for TtyResolver {
+    async fn confirm(&self, tool_name: &str, input: &str) -> bool {
+        prompt_user_confirmation(tool_name, input)
+    }
+}
+
+/// the CLI's stream renderer: assistant text to stdout, reasoning + tool
+/// activity to stderr (suppressed by --quiet), reproducing hrns's output.
+struct StdioObserver {
+    in_reasoning: bool,
+}
+
+impl StdioObserver {
+    fn new() -> Self {
+        Self {
+            in_reasoning: false,
+        }
     }
 
-    match client_type {
-        "openai_completions" => {
-            let client = build_openai_client!();
-            let model = client.completion_model(model_name).completions_api();
-            build_and_stream!(model: model, max_tokens, max_turns, tools, tools_override, permissions, hooks, system_prompt, user_prompt);
-        },
-        "openai" | "openai_responses" => {
-            let client = build_openai_client!();
-            build_and_stream!(client: client, model_name, max_tokens, max_turns, tools, tools_override, permissions, hooks, system_prompt, user_prompt);
-        },
-        "anthropic" => {
-            let mut builder = providers::anthropic::Client::builder().api_key(api_key);
-            if let Some(url) = base_url {
-                builder = builder.base_url(&url);
-            }
-            let client = builder.build().expect("failed to build Anthropic client");
-            build_and_stream!(client: client, model_name, max_tokens, max_turns, tools, tools_override, permissions, hooks, system_prompt, user_prompt);
-        },
-        "gemini" => {
-            let mut builder = providers::gemini::Client::builder().api_key(api_key);
-            if let Some(url) = base_url {
-                builder = builder.base_url(&url);
-            }
-            let client = builder.build().expect("failed to build Gemini client");
-            build_and_stream!(client: client, model_name, max_tokens, max_turns, tools, tools_override, permissions, hooks, system_prompt, user_prompt);
-        },
-        "cohere" => {
-            let mut builder = providers::cohere::Client::builder().api_key(api_key);
-            if let Some(url) = base_url {
-                builder = builder.base_url(&url);
-            }
-            let client = builder.build().expect("failed to build Cohere client");
-            build_and_stream!(client: client, model_name, max_tokens, max_turns, tools, tools_override, permissions, hooks, system_prompt, user_prompt);
-        },
-        "xai" => {
-            let mut builder = providers::xai::Client::builder().api_key(api_key);
-            if let Some(url) = base_url {
-                builder = builder.base_url(&url);
-            }
-            let client = builder.build().expect("failed to build xAI client");
-            build_and_stream!(client: client, model_name, max_tokens, max_turns, tools, tools_override, permissions, hooks, system_prompt, user_prompt);
-        },
-        _ => return Err(format!("unsupported client type: {}", client_type).into()),
+    /// closes an open reasoning run with a newline before other output.
+    fn end_reasoning(&mut self) {
+        if self.in_reasoning {
+            let mut stderr = io::stderr();
+            let _ = stderr.write_all(b"\n");
+            let _ = stderr.flush();
+            self.in_reasoning = false;
+        }
     }
-    
-    println!();
-    Ok(())
+}
+
+impl Observer for StdioObserver {
+    fn text(&mut self, delta: &str) {
+        self.end_reasoning();
+        let mut stdout = io::stdout();
+        let _ = stdout.write_all(delta.as_bytes());
+        let _ = stdout.flush();
+    }
+
+    fn reasoning(&mut self, delta: &str) {
+        if QUIET.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut stderr = io::stderr();
+        let _ = stderr.write_all(b"\x1b[2;3m");
+        let _ = stderr.write_all(delta.as_bytes());
+        let _ = stderr.write_all(b"\x1b[0m");
+        let _ = stderr.flush();
+        self.in_reasoning = true;
+    }
+
+    fn tool_call(&mut self, name: &str, args: &str) {
+        self.end_reasoning();
+        if QUIET.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut stderr = io::stderr();
+        let _ = writeln!(stderr, "\x1b[1;36m{}\x1b[0m\x1b[2m({})\x1b[0m", name, args);
+        let _ = stderr.flush();
+    }
+
+    fn tool_result(&mut self, result: &str) {
+        self.end_reasoning();
+        if QUIET.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut stderr = io::stderr();
+        let limit = TOOL_OUTPUT_TRUNCATE.load(Ordering::Relaxed);
+        if limit > 0 && result.len() > limit {
+            // slice on a char boundary <= limit
+            let mut cut = limit.min(result.len());
+            while !result.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let head = &result[..cut];
+            let total = result.len();
+            let spool = write_spool_file(result);
+            let _ = writeln!(stderr, "\x1b[2m  -> {}\x1b[0m", head.replace('\n', "\\n"));
+            match spool {
+                Some(p) => {
+                    let _ = writeln!(stderr,
+                        "\x1b[33m  ! truncated tool output: {} of {} bytes shown. full content at {} (read with: cat {})\x1b[0m",
+                        cut, total, p.display(), p.display());
+                }
+                None => {
+                    let _ = writeln!(stderr,
+                        "\x1b[33m  ! truncated tool output: {} of {} bytes shown (failed to spool full content)\x1b[0m",
+                        cut, total);
+                }
+            }
+        } else {
+            let _ = writeln!(stderr, "\x1b[2m  -> {}\x1b[0m", result.replace('\n', "\\n"));
+        }
+        let _ = stderr.flush();
+    }
+
+    fn error(&mut self, message: &str) {
+        eprintln!("stream error: {}", message);
+    }
+
+    fn restart(&mut self) {
+        // the CLI streams continuously; just close any open reasoning run.
+        self.end_reasoning();
+    }
+
+    fn end_stream(&mut self) {
+        self.end_reasoning();
+    }
+}
+
+/// bridges hrns's HCP host (src/hooks.rs) onto the core's tool-middleware seam:
+/// per-tool before/after interception and the gated hook-registered tool set.
+struct HcpMiddleware {
+    hooks: Arc<HookManager>,
+    permissions: PermissionsConfig,
+    resolver: Arc<dyn PermissionResolver>,
+    tools: ToolsConfig,
+    tools_override: Option<Vec<String>>,
+}
+
+#[async_trait]
+impl ToolMiddleware for HcpMiddleware {
+    async fn before_tool(&self, tool: &str, call_id: &str, args: &serde_json::Value) -> BeforeTool {
+        let r = self.hooks.before_tool(tool, call_id, args);
+        // the v2 HCP host has no args-rewrite hook, so tool_input passes through unchanged.
+        BeforeTool {
+            deny: r.deny,
+            result: r.result,
+            args: None,
+        }
+    }
+
+    async fn after_tool(&self, tool: &str, call_id: &str, output: &str) -> Option<String> {
+        self.hooks.after_tool(tool, call_id, output).result
+    }
+
+    fn extra_tools(&self) -> Vec<Box<dyn ToolDyn>> {
+        // hook tools are gated by [tools] on their full_name (e.g. datetime_now)
+        // in addition to the [hooks] gate that decided which scripts to load.
+        self.hooks
+            .into_dyn_tools(&self.permissions, &self.resolver)
+            .into_iter()
+            .filter(|t| {
+                self.tools
+                    .is_active(&ToolDyn::name(t.as_ref()), &self.tools_override)
+            })
+            .collect()
+    }
 }
 
 #[tokio::main]
@@ -1468,28 +543,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.list_agents {
-        let items: Vec<(String, String)> = find_all_in_dirs(Kind::Agent).into_iter().map(|(name, path)| {
-            let desc = fs::read_to_string(&path).ok()
-                .and_then(|c| parse_markdown_with_frontmatter::<AgentFrontmatter>(&c).ok())
-                .and_then(|doc| doc.frontmatter.description)
-                .unwrap_or_default();
-            (name, desc)
-        }).collect();
-        let rows: Vec<Vec<&str>> = items.iter().map(|(n, d)| vec![n.as_str(), d.as_str()]).collect();
+        let items: Vec<(String, String)> = find_all_in_dirs(Kind::Agent)
+            .into_iter()
+            .map(|(name, path)| {
+                let desc = fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|c| parse_markdown_with_frontmatter::<AgentFrontmatter>(&c).ok())
+                    .and_then(|doc| doc.frontmatter.description)
+                    .unwrap_or_default();
+                (name, desc)
+            })
+            .collect();
+        let rows: Vec<Vec<&str>> = items
+            .iter()
+            .map(|(n, d)| vec![n.as_str(), d.as_str()])
+            .collect();
         print_table(Some(&["name", "description"]), &rows);
         process::exit(0);
     }
 
     if args.list_skills {
-        let items: Vec<(String, String, &'static str)> = find_all_in_dirs(Kind::Skill).into_iter().map(|(name, path)| {
-            let desc = fs::read_to_string(&path).ok()
-                .and_then(|c| parse_markdown_with_frontmatter::<SkillFrontmatter>(&c).ok())
-                .and_then(|doc| doc.frontmatter.description)
-                .unwrap_or_default();
-            let status = if config.skills.is_active(&name) { "true" } else { "false" };
-            (name, desc, status)
-        }).collect();
-        let rows: Vec<Vec<&str>> = items.iter().map(|(n, d, s)| vec![n.as_str(), d.as_str(), *s]).collect();
+        let items: Vec<(String, String, &'static str)> = find_all_in_dirs(Kind::Skill)
+            .into_iter()
+            .map(|(name, path)| {
+                let desc = fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|c| parse_markdown_with_frontmatter::<SkillFrontmatter>(&c).ok())
+                    .and_then(|doc| doc.frontmatter.description)
+                    .unwrap_or_default();
+                let status = if config.skills.is_active(&name) {
+                    "true"
+                } else {
+                    "false"
+                };
+                (name, desc, status)
+            })
+            .collect();
+        let rows: Vec<Vec<&str>> = items
+            .iter()
+            .map(|(n, d, s)| vec![n.as_str(), d.as_str(), *s])
+            .collect();
         print_table(Some(&["name", "description", "enabled"]), &rows);
         process::exit(0);
     }
@@ -1501,21 +594,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let all_hooks = HookManager::discover();
 
     if args.list_tools {
-        let read_status = if config.tools.is_active("read", &args.tools) { "true" } else { "false" };
-        let bash_status = if config.tools.is_active("bash", &args.tools) { "true" } else { "false" };
+        let read_status = if config.tools.is_active("read", &args.tools) {
+            "true"
+        } else {
+            "false"
+        };
+        let bash_status = if config.tools.is_active("bash", &args.tools) {
+            "true"
+        } else {
+            "false"
+        };
         let mut rows: Vec<Vec<String>> = vec![
-            vec!["read".into(), "read the contents of a file".into(), read_status.into()],
-            vec!["bash".into(), "execute a bash command".into(), bash_status.into()],
+            vec![
+                "read".into(),
+                "read the contents of a file".into(),
+                read_status.into(),
+            ],
+            vec![
+                "bash".into(),
+                "execute a bash command".into(),
+                bash_status.into(),
+            ],
         ];
         for script in all_hooks.scripts() {
             let hook_active = config.hooks.is_active(&script.name, &args.hooks);
             for tool in &script.tools {
                 let active = hook_active && config.tools.is_active(&tool.full_name, &args.tools);
                 let status = if active { "true" } else { "false" };
-                rows.push(vec![tool.full_name.clone(), tool.description.clone(), status.into()]);
+                rows.push(vec![
+                    tool.full_name.clone(),
+                    tool.description.clone(),
+                    status.into(),
+                ]);
             }
         }
-        let row_refs: Vec<Vec<&str>> = rows.iter().map(|r| r.iter().map(|s| s.as_str()).collect()).collect();
+        let row_refs: Vec<Vec<&str>> = rows
+            .iter()
+            .map(|r| r.iter().map(|s| s.as_str()).collect())
+            .collect();
         print_table(Some(&["name", "description", "enabled"]), &row_refs);
         process::exit(0);
     }
@@ -1523,15 +639,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.list_hooks {
         let mut rows: Vec<Vec<String>> = Vec::new();
         for script in all_hooks.scripts() {
-            let status = if config.hooks.is_active(&script.name, &args.hooks) { "true" } else { "false" };
+            let status = if config.hooks.is_active(&script.name, &args.hooks) {
+                "true"
+            } else {
+                "false"
+            };
             rows.push(vec![
                 script.name.clone(),
                 shorten_path(&script.path),
-                script.tools.iter().map(|t| t.full_name.clone()).collect::<Vec<_>>().join(","),
+                script
+                    .tools
+                    .iter()
+                    .map(|t| t.full_name.clone())
+                    .collect::<Vec<_>>()
+                    .join(","),
                 status.into(),
             ]);
         }
-        let row_refs: Vec<Vec<&str>> = rows.iter().map(|r| r.iter().map(|s| s.as_str()).collect()).collect();
+        let row_refs: Vec<Vec<&str>> = rows
+            .iter()
+            .map(|r| r.iter().map(|s| s.as_str()).collect())
+            .collect();
         print_table(Some(&["name", "path", "tools", "enabled"]), &row_refs);
         process::exit(0);
     }
@@ -1541,38 +669,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hooks = Arc::new(all_hooks.retain(|name| hooks_config.is_active(name, &hooks_override)));
 
     if args.list_providers {
-        let items: Vec<(String, String, String)> = config.providers.iter().map(|p| {
-            let client = p.client.as_deref().unwrap_or(&p.name).to_string();
-            let url = p.base_url.as_deref().unwrap_or("-").to_string();
-            (p.name.clone(), client, url)
-        }).collect();
-        let rows: Vec<Vec<&str>> = items.iter().map(|(n, c, u)| vec![n.as_str(), c.as_str(), u.as_str()]).collect();
+        let items: Vec<(String, String, String)> = config
+            .providers
+            .iter()
+            .map(|p| {
+                let client = p.client.as_deref().unwrap_or(&p.name).to_string();
+                let url = p.base_url.as_deref().unwrap_or("-").to_string();
+                (p.name.clone(), client, url)
+            })
+            .collect();
+        let rows: Vec<Vec<&str>> = items
+            .iter()
+            .map(|(n, c, u)| vec![n.as_str(), c.as_str(), u.as_str()])
+            .collect();
         print_table(Some(&["name", "client", "base_url"]), &rows);
         process::exit(0);
     }
-    
+
     let default_sp = config.default_system_prompt.clone().unwrap_or_default();
-    let (mut system_prompt, agent_model, agent_tools, agent_permissions) = if let Some(agent_name) = &args.agent_name {
-        let agent = load_agent(agent_name)?;
-        if let Some(ref override_prompt) = args.system_prompt {
-            // -s overrides the entire system prompt (no agent body or skills)
-            (override_prompt.clone(), agent.frontmatter.model, agent.frontmatter.tools, agent.frontmatter.permissions)
-        } else if let Some(skills) = &args.skills {
-            // --skills overrides agent skills exclusively
-            let mut prompt = agent.body.clone();
-            append_skills(&mut prompt, skills, &config.skills);
-            (prompt, agent.frontmatter.model, agent.frontmatter.tools, agent.frontmatter.permissions)
+    let (mut system_prompt, agent_model, agent_tools, agent_permissions) =
+        if let Some(agent_name) = &args.agent_name {
+            let agent = load_agent(agent_name)?;
+            if let Some(ref override_prompt) = args.system_prompt {
+                // -s overrides the entire system prompt (no agent body or skills)
+                (
+                    override_prompt.clone(),
+                    agent.frontmatter.model,
+                    agent.frontmatter.tools,
+                    agent.frontmatter.permissions,
+                )
+            } else if let Some(skills) = &args.skills {
+                // --skills overrides agent skills exclusively
+                let mut prompt = agent.body.clone();
+                append_skills(&mut prompt, skills, &config.skills);
+                (
+                    prompt,
+                    agent.frontmatter.model,
+                    agent.frontmatter.tools,
+                    agent.frontmatter.permissions,
+                )
+            } else {
+                let prompt = build_system_prompt(&agent, &config.skills);
+                (
+                    prompt,
+                    agent.frontmatter.model,
+                    agent.frontmatter.tools,
+                    agent.frontmatter.permissions,
+                )
+            }
         } else {
-            let prompt = build_system_prompt(&agent, &config.skills);
-            (prompt, agent.frontmatter.model, agent.frontmatter.tools, agent.frontmatter.permissions)
-        }
-    } else {
-        let mut prompt = args.system_prompt.clone().unwrap_or_default();
-        if let Some(ref skill_list) = args.skills {
-            append_skills(&mut prompt, skill_list, &config.skills);
-        }
-        (prompt, None, ToolsConfig::default(), PermissionsConfig::default())
-    };
+            let mut prompt = args.system_prompt.clone().unwrap_or_default();
+            if let Some(ref skill_list) = args.skills {
+                append_skills(&mut prompt, skill_list, &config.skills);
+            }
+            (
+                prompt,
+                None,
+                ToolsConfig::default(),
+                PermissionsConfig::default(),
+            )
+        };
 
     // fall back to config.default_system_prompt when nothing else set one
     if system_prompt.is_empty() && !default_sp.is_empty() {
@@ -1585,15 +741,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tools = config.tools.clone().merge(agent_tools);
     let mut perm_overrides: Vec<PermissionOverride> = Vec::new();
     for (tool, pattern) in &args.permissions_allow {
-        perm_overrides.push(PermissionOverride { tool: tool.clone(), pattern: pattern.clone(), level: PermissionLevel::Allow });
+        perm_overrides.push(PermissionOverride {
+            tool: tool.clone(),
+            pattern: pattern.clone(),
+            level: PermissionLevel::Allow,
+        });
     }
     for (tool, pattern) in &args.permissions_ask {
-        perm_overrides.push(PermissionOverride { tool: tool.clone(), pattern: pattern.clone(), level: PermissionLevel::Ask });
+        perm_overrides.push(PermissionOverride {
+            tool: tool.clone(),
+            pattern: pattern.clone(),
+            level: PermissionLevel::Ask,
+        });
     }
     for (tool, pattern) in &args.permissions_deny {
-        perm_overrides.push(PermissionOverride { tool: tool.clone(), pattern: pattern.clone(), level: PermissionLevel::Deny });
+        perm_overrides.push(PermissionOverride {
+            tool: tool.clone(),
+            pattern: pattern.clone(),
+            level: PermissionLevel::Deny,
+        });
     }
-    let permissions = config.permissions.clone()
+    let permissions = config
+        .permissions
+        .clone()
         .merge(agent_permissions)
         .apply_overrides(&perm_overrides);
 
@@ -1613,7 +783,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let full_model_name = args.model.clone()
+    let full_model_name = args
+        .model
+        .clone()
         .or(agent_model)
         .or(config.default_model.clone())
         .unwrap_or_else(|| "openai/gpt-4o".to_string());
@@ -1633,45 +805,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // blank lines from the frontmatter split; strip them so the prompt
     // sent to the model is tidy.
     let system_prompt = system_prompt.trim().to_string();
-        
-    let (provider_name, model_name) = full_model_name.split_once('/').unwrap_or(("openai", &full_model_name));
-    
-    let default_provider_config = ProviderConfig {
-        name: provider_name.to_string(),
-        client: Some(provider_name.to_string()),
-        ..Default::default()
-    };
-    
-    let provider_config = config.providers.iter()
-        .find(|p| p.name == provider_name)
-        .unwrap_or(&default_provider_config);
-        
-    let client_type = provider_config.client.as_deref().unwrap_or(provider_name);
-
-    let api_key = provider_config.api_key.clone()
-        .unwrap_or_else(|| {
-            let env_var_name = match client_type {
-                "openai" | "openai_completions" | "openai_responses" => "OPENAI_API_KEY",
-                "anthropic" => "ANTHROPIC_API_KEY",
-                "gemini" => "GEMINI_API_KEY",
-                "cohere" => "COHERE_API_KEY",
-                "xai" => "XAI_API_KEY",
-                _ => "",
-            };
-            env::var(env_var_name).unwrap_or_default()
-        });
-
-    let base_url = provider_config.base_url.clone();
 
     // no preflight on api_key: providers that don't require auth (e.g. local
-    // openai-compatible servers) work keyless; hosted providers will return a
-    // clear auth error from the upstream API at request time.
+    // openai-compatible servers) work keyless; hosted providers return a clear
+    // auth error from the upstream API at request time.
+    let hrns_core::Resolved {
+        provider_name,
+        client_type,
+        model_name,
+        api_key,
+        base_url,
+    } = hrns_core::resolve_provider(&config, &full_model_name);
 
     if args.verbose {
         tracing_subscriber::fmt()
             .with_env_filter(
-                EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new("rig=debug"))
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("rig=debug")),
             )
             .with_writer(io::stderr)
             .init();
@@ -1684,7 +833,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("debug: permissions {:?}", permissions);
     }
 
-    let max_tokens = args.max_tokens
+    let max_tokens = args
+        .max_tokens
         .or(config.default_max_tokens)
         .unwrap_or(DEFAULT_MAX_TOKENS);
 
@@ -1696,7 +846,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("max_tokens: {}", max_tokens);
         println!("max_turns: {}", max_turns);
 
-        let mut active_tools: Vec<String> = ["read", "bash"].iter()
+        let mut active_tools: Vec<String> = ["read", "bash"]
+            .iter()
             .filter(|t| tools.is_active(t, &args.tools))
             .map(|s| s.to_string())
             .collect();
@@ -1725,8 +876,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !hooks.scripts().is_empty() {
             println!("\n--- hooks ---");
             for script in hooks.scripts() {
-                let tool_list: Vec<&str> = script.tools.iter().map(|t| t.full_name.as_str()).collect();
-                println!("{}  {}  [{}]", script.name, script.path.display(), tool_list.join(","));
+                let tool_list: Vec<&str> =
+                    script.tools.iter().map(|t| t.full_name.as_str()).collect();
+                println!(
+                    "{}  {}  [{}]",
+                    script.name,
+                    script.path.display(),
+                    tool_list.join(",")
+                );
             }
         }
 
@@ -1779,193 +936,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    run_agent_stream(
-        client_type,
-        model_name,
-        &api_key,
-        base_url,
-        max_tokens,
-        max_turns,
-        &tools,
-        &args.tools,
-        &permissions,
-        &hooks,
-        &system_prompt,
-        &user_prompt,
-    ).await
-}
+    let resolver: Arc<dyn PermissionResolver> = Arc::new(TtyResolver);
+    let middleware: Arc<dyn ToolMiddleware> = Arc::new(HcpMiddleware {
+        hooks: hooks.clone(),
+        permissions: permissions.clone(),
+        resolver: resolver.clone(),
+        tools: tools.clone(),
+        tools_override: args.tools.clone(),
+    });
+    let mut observer = StdioObserver::new();
+    // the CLI is one-shot: no prior history in, the returned history unused, and no
+    // steering (the steer channel closes at once so its select branch stays disabled).
+    let (_, steer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    let outcome = hrns_core::run(
+        RunConfig {
+            client_type: &client_type,
+            model_name: &model_name,
+            api_key: &api_key,
+            base_url: base_url.as_deref(),
+            max_tokens,
+            max_turns,
+            tools: &tools,
+            tools_override: &args.tools,
+            permissions: &permissions,
+            system_prompt: &system_prompt,
+            user_prompt: &user_prompt,
+            attachments: &[],
+            additional_params: None,
+        },
+        resolver,
+        middleware,
+        &mut observer,
+        Vec::new(),
+        // the CLI runs one turn to completion; a never-cancelled token.
+        CancellationToken::new(),
+        steer_rx,
+    )
+    .await?;
 
-    // --- read tool slicing ---
-
-    #[test]
-    fn test_slice_lines_no_args_returns_full() {
-        let s = "a\nb\nc";
-        assert_eq!(slice_lines(s, None, None), s);
-    }
-
-    #[test]
-    fn test_slice_lines_offset_only() {
-        let s = "a\nb\nc\nd";
-        assert_eq!(slice_lines(s, Some(1), None), "b\nc\nd");
-    }
-
-    #[test]
-    fn test_slice_lines_offset_and_count() {
-        let s = "a\nb\nc\nd\ne";
-        assert_eq!(slice_lines(s, Some(1), Some(2)), "b\nc");
-    }
-
-    #[test]
-    fn test_slice_lines_count_past_end_is_clamped() {
-        let s = "a\nb";
-        assert_eq!(slice_lines(s, Some(0), Some(99)), "a\nb");
-    }
-
-    #[test]
-    fn test_slice_lines_offset_past_end_returns_empty() {
-        assert_eq!(slice_lines("a\nb", Some(99), None), "");
-    }
-
-    // --- bash command validation ---
-
-    #[test]
-    fn test_simple_commands_pass_validation() {
-        assert!(is_simple_bash_command("apt update"));
-        assert!(is_simple_bash_command("ls -la /home"));
-        assert!(is_simple_bash_command("find /home -name '*.jpg'"));
-    }
-
-    #[test]
-    fn test_metacharacters_fail_validation() {
-        assert!(!is_simple_bash_command("ls | grep foo"));
-        assert!(!is_simple_bash_command("apt update; rm -rf /"));
-        assert!(!is_simple_bash_command("apt update && malicious"));
-        assert!(!is_simple_bash_command("echo `whoami`"));
-        assert!(!is_simple_bash_command("echo $(whoami)"));
-        assert!(!is_simple_bash_command("echo hi > /etc/passwd"));
-        assert!(!is_simple_bash_command("apt\\ update"));
-        assert!(!is_simple_bash_command("apt update\nrm -rf /"));
-    }
-
-    // --- glob matching ---
-
-    // --- glob matching (path mode) ---
-
-    #[test]
-    fn test_glob_exact_match() {
-        assert!(glob_matches("apt update", "apt update", true).is_some());
-        assert!(glob_matches("apt update", "apt upgrade", true).is_none());
-    }
-
-    #[test]
-    fn test_glob_star_path_mode() {
-        assert!(glob_matches("/etc/*", "/etc/passwd", true).is_some());
-        // `*` should NOT cross `/` in path mode
-        assert!(glob_matches("/etc/*", "/etc/ssh/config", true).is_none());
-    }
-
-    #[test]
-    fn test_glob_star_command_mode() {
-        // `*` crosses `/` in command mode
-        assert!(glob_matches("ls *", "ls -la /home/user", false).is_some());
-        assert!(glob_matches("*", "anything/with/slashes", false).is_some());
-    }
-
-    #[test]
-    fn test_glob_doublestar_matches_across_slashes() {
-        assert!(glob_matches("/home/**", "/home/user/photos/pic.jpg", true).is_some());
-        assert!(glob_matches("/home/**/pic.jpg", "/home/user/photos/pic.jpg", true).is_some());
-        assert!(glob_matches("**/*.jpg", "/home/user/pic.jpg", true).is_some());
-    }
-
-    #[test]
-    fn test_glob_question_mark_path_mode() {
-        assert!(glob_matches("file?.txt", "file1.txt", true).is_some());
-        assert!(glob_matches("file?.txt", "file12.txt", true).is_none());
-        // `?` should not match `/` in path mode
-        assert!(glob_matches("a?b", "a/b", true).is_none());
-    }
-
-    #[test]
-    fn test_glob_question_mark_command_mode() {
-        // `?` matches `/` in command mode
-        assert!(glob_matches("a?b", "a/b", false).is_some());
-    }
-
-    #[test]
-    fn test_glob_bare_star_path_mode() {
-        assert!(glob_matches("*", "anything", true).is_some());
-        // bare `*` does not cross slashes in path mode
-        assert!(glob_matches("*", "a/b", true).is_none());
-        // but `**` does
-        assert!(glob_matches("**", "a/b", true).is_some());
-    }
-
-    #[test]
-    fn test_glob_specificity_ordering() {
-        let exact = glob_matches("/etc/passwd", "/etc/passwd", true).unwrap();
-        let glob = glob_matches("/etc/*", "/etc/passwd", true).unwrap();
-        assert!(exact > glob);
-    }
-
-    // --- permission resolution (path mode for read) ---
-
-    #[test]
-    fn test_permission_path_patterns() {
-        let mut patterns = HashMap::new();
-        patterns.insert("**".to_string(), PermissionLevel::Deny);
-        patterns.insert("/etc/os-release".to_string(), PermissionLevel::Allow);
-        let perm = Permission::Patterns(patterns);
-        assert_eq!(perm.check("/etc/os-release", true), PermissionLevel::Allow);
-        assert_eq!(perm.check("/etc/shadow", true), PermissionLevel::Deny);
-    }
-
-    #[test]
-    fn test_permission_doublestar_dir_pattern() {
-        let mut patterns = HashMap::new();
-        patterns.insert("**".to_string(), PermissionLevel::Deny);
-        patterns.insert("/home/**".to_string(), PermissionLevel::Allow);
-        let perm = Permission::Patterns(patterns);
-        assert_eq!(perm.check("/home/user/file.txt", true), PermissionLevel::Allow);
-        assert_eq!(perm.check("/etc/passwd", true), PermissionLevel::Deny);
-    }
-
-    // --- permission resolution (command mode for bash) ---
-
-    #[test]
-    fn test_permission_command_star_matches_slashes() {
-        let mut patterns = HashMap::new();
-        patterns.insert("*".to_string(), PermissionLevel::Deny);
-        patterns.insert("ls *".to_string(), PermissionLevel::Allow);
-        let perm = Permission::Patterns(patterns);
-        // in command mode, "ls *" matches args with slashes
-        assert_eq!(perm.check("ls -la /home/user", false), PermissionLevel::Allow);
-        assert_eq!(perm.check("rm -rf /", false), PermissionLevel::Deny);
-    }
-
-    #[test]
-    fn test_permission_command_most_specific_wins() {
-        let mut patterns = HashMap::new();
-        patterns.insert("*".to_string(), PermissionLevel::Deny);
-        patterns.insert("apt update".to_string(), PermissionLevel::Allow);
-        let perm = Permission::Patterns(patterns);
-        assert_eq!(perm.check("apt update", false), PermissionLevel::Allow);
-        assert_eq!(perm.check("rm -rf /", false), PermissionLevel::Deny);
-    }
-
-    #[test]
-    fn test_permission_trailing_wildcard_matches_no_args() {
-        let mut patterns = HashMap::new();
-        patterns.insert("*".to_string(), PermissionLevel::Deny);
-        patterns.insert("ls *".to_string(), PermissionLevel::Allow);
-        let perm = Permission::Patterns(patterns);
-        // "ls *" should also match bare "ls" (no args)
-        assert_eq!(perm.check("ls", false), PermissionLevel::Allow);
-        assert_eq!(perm.check("ls -la /home", false), PermissionLevel::Allow);
-        assert_eq!(perm.check("rm", false), PermissionLevel::Deny);
-    }
+    // tier 1: notify hooks that the loop terminated. observational only;
+    // `continue` responses are accepted in the wire format but not honored, so
+    // `final` is always true.
+    hooks.before_stop(outcome.exit_reason, outcome.exit_error.as_deref());
+    println!();
+    Ok(())
 }

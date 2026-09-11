@@ -12,4 +12,4 @@
    `execute_tool`, `before_tool`, `after_tool`, and `before_stop`.
    workspace-shaped session-bound stages (`heartbeat`, `compacting`,
    `recover`, `format_notification`, `observe_message`, `actions`) are
-   explicitly out of scope; airun declares partial conformance.
+   explicitly out of scope; hrns declares partial conformance.
